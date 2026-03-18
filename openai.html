@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <link rel="icon" href="data:,">
 
-  <title>HeadAudio - OpenAI</title>
+  <title>HeadAudio - OpenRouter</title>
 
   <style>
     body, html {
@@ -66,14 +66,9 @@
     const headaudioProcessor = "./dist/headworklet.min.mjs";
     const headaudioModel = "./dist/model-en-mixed.bin";
     
-    // WebRTC
-    let connection; // RTC Peer Connection
-    let datachannel; // Data channel
-    let micTrack; // Microphone audio track
-
-    // OpenAPI realtime API
-    const model = "gpt-realtime-mini";
-    const voice = "marin";
+    // OpenRouter Chat Completions API (audio)
+    const model = "openai/gpt-audio-mini";
+    const voice = "alloy"; // Valid OpenAI audio voice
     const instructions = [
       "Your name is Julia. You are a clear, concise, and conversational English-speaking assistant.",
       "\nInteraction:",
@@ -83,59 +78,47 @@
       "\nPersonality:",
       "- Be calm, helpful, and friendly.",
       "\nEmbodied avatar:",
-      "- You have a human-like 3D avatar that the user can see. You can control your avatar using function calling.",
-      "- Express yourself by simulating emotions with avatar moods, hand gestures, and emojis via function calling."
+      "- You have a human-like 3D avatar that the user can see.",
+      "- To control the avatar, embed silent command tokens anywhere in your reply text. They will not be spoken.",
+      "- Mood (pick one): [CMD:mood:neutral] [CMD:mood:happy] [CMD:mood:angry] [CMD:mood:sad] [CMD:mood:fear] [CMD:mood:disgust] [CMD:mood:love] [CMD:mood:sleep]",
+      "- Gesture (pick one): [CMD:gesture:handup] [CMD:gesture:index] [CMD:gesture:ok] [CMD:gesture:thumbup] [CMD:gesture:thumbdown] [CMD:gesture:side] [CMD:gesture:shrug] [CMD:gesture:namaste]",
+      "- Emoji (single face emoji): [CMD:emoji:😊]",
+      "- Example: \"Hello! [CMD:mood:happy][CMD:gesture:handup] How can I help you today?\""
     ].join("\n");
-    const initialMessage = "Introduce yourself and ask how you can help.";
-    const closingMessage = "The user wants to end this session. Say a quick good-bye to the user.";
-    let isClosing = false;
-    let audioMuted; // Used as a workaround for a known Chrome bug
-    const functions = [
-      {
-        type: "function",
-        name: "set_mood",
-        description: "change your own mood",
-        parameters: {
-          type: "object",
-          properties: {
-            "mood": {
-              type: "string",
-              enum: ["neutral", "happy", "angry", "sad", "fear", "disgust", "love", "sleep"],
-              description: "Mood name"
-            }
-          }
-        }
-      },
-      {
-        type: "function",
-        name: "make_hand_gesture",
-        description: "make a hand gesture",
-        parameters: {
-          type: "object",
-          properties: {
-            "gesture": {
-              type: "string",
-              enum: ["handup", "index", "ok", "thumbup", "thumbdown", "side", "shrug", "namaste"],
-              description: "Hand gesture name"
-            }
-          }
-        }
-      },
-      {
-        type: "function",
-        name: "make_facial_expression",
-        description: "make a facial expression",
-        parameters: {
-          type: "object",
-          properties: {
-            "emoji": {
-              type: "string",
-              description: "Single face emoji"
-            }
-          }
-        }
-      }
-    ];
+
+    // Session state
+    let sessionActive = false;
+    let micStream = null;
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecording = false;
+    let isAISpeaking = false;
+    let silenceTimer = null;
+    let vadRafId = null;
+    let analyserNode = null;
+    let conversationHistory = [];
+    let sessionApiKey = "";
+
+    // VAD thresholds
+    const VAD_SPEECH_DB = -40;   // dB above which audio is considered speech
+    const VAD_SILENCE_MS = 1200; // ms of silence before sending the recorded turn
+    const VAD_MIN_MS     = 300;  // minimum recording length to avoid sending noise
+
+    /**
+    * Parse and execute [CMD:type:value] tokens embedded in the AI transcript.
+    * Returns the transcript with all CMD tokens stripped out.
+    *
+    * @param {string} text Raw transcript from AI.
+    * @return {string} Cleaned transcript without CMD tokens.
+    */
+    function parseAndExecuteCmds(text) {
+      return String(text || "").replace(/\[CMD:(\w+):([^\]]+)\]/g, (_, type, value) => {
+        if (type === "mood") head.setMood(value);
+        else if (type === "gesture") head.playGesture(value);
+        else if (type === "emoji") head.speakEmoji(value);
+        return ""; // strip token from spoken text
+      });
+    }
 
     // Other globals
     const el = {}; // DOM elements based in `id` property
@@ -173,6 +156,18 @@
           .then(val => { clearTimeout(id); resolve(val); })
           .catch(err => { clearTimeout(id); reject(err); });
       });
+    }
+
+    /**
+    * Redact API-like secrets from text before logging or showing them.
+    *
+    * @param {string} s Text to sanitize.
+    * @return {string} Sanitized text.
+    */
+    function redactSecrets(s) {
+      return String(s || "")
+        .replace(/sk-[A-Za-z0-9_-]+/g, "[REDACTED_API_KEY]")
+        .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [REDACTED]");
     }
 
     /**
@@ -277,299 +272,415 @@
     }
 
     /**
-    * Send system message.
-    * 
-    * @param {string} s System message.
+    * Start a new turn-based session using OpenRouter chat completions audio API.
+    * Sets up the microphone, VAD loop, and sends an initial greeting turn.
     */
-    function sendSystemMessage(s) {
-      if ( datachannel ) {
-        const message = {
-          type: "response.create",
-          response: {
-            input: [
-              {
-                type: "message",
-                role: "system",
-                content: [
-                  {
-                    type: "input_text",
-                    text: s
-                  }
-                ]
-              }
-            ],
-            output_modalities: ["audio"]
-          }
-        };
-        datachannel.send(JSON.stringify(message));
-      }
-    }
-
-    /**
-    * Send cancel.
-    */
-    function sendCancel() {
-      if ( datachannel ) {
-        const message = {
-          type: "response.cancel"
-        };
-        datachannel.send(JSON.stringify(message));
-      }
-    }
-    
-    /**
-    * Send initial instructions.
-    */
-    function sendInitialMessage() {
-      sendSystemMessage(initialMessage);
-    }
-
-    /**
-    * Send closing message.
-    */
-    function sendClosingMessage() {
-      sendSystemMessage(closingMessage);
-    }
-
-    /**
-    * Handle incoming messages.
-    */
-    function handleMessage(event) {
-      const message = JSON.parse(event.data);
-      const type = message.type;
-      
-      // For debugging, but ignore delta messages
-      if ( !type.endsWith("delta") ) { 
-        console.info(`Server: ${message.type}`, message);
-      }
-
-      switch (type) {
-      case "session.created":
-        const expiresAt = new Date(message?.session?.expires_at * 1000);
-        console.log(`Session created and will expire at ${expiresAt}`, message);
-        break;
-
-      case "input_audio_buffer.speech_started":
-        head.lookAtCamera(500); // Listen the user
-        break;
-
-      case "response.function_call_arguments.done":
-        const name = message.name;
-        const jsonArgs = message.arguments;
-        let args = jsonArgs ? JSON.parse(jsonArgs) : null;
-
-        // Function calling
-        if (name === "set_mood" && args?.mood) {
-          head.setMood(args.mood);
-        } else if (name === "make_hand_gesture" && args?.gesture) {
-          head.playGesture(args.gesture);
-        } else if (name === "make_facial_expression" && args?.emoji) {
-          head.speakEmoji(args.emoji);
-        }
-
-        break;
-
-      case "output_audio_buffer.started":
-        head.isSpeaking = true;
-        break;
-
-      case "output_audio_buffer.stopped":
-        head.isSpeaking = false;
-        if ( isClosing ) {
-          endSession();
-        }
-        break;
-
-      }
-    }
-
-    /**
-     * Start a new WebRTC session with the OpenAI Realtime API.
-     */
     async function startSession() {
       console.log("Session starting...");
 
-      // Microphone
-      let stream;
+      // Capture API key once at connect time
+      sessionApiKey = (el.apikey.value || "").trim();
+      if (sessionApiKey.toLowerCase().startsWith("bearer ")) {
+        sessionApiKey = sessionApiKey.slice(7).trim();
+      }
+      if (!sessionApiKey) {
+        el.info.style.display = 'block';
+        el.info.textContent = "Error: Missing OpenRouter API key.";
+        return;
+      }
+
       try {
-        stream = await navigator.mediaDevices.getUserMedia({audio: true});
-        if (!stream) {
-          console.error("Failed to get mic stream");
-          return;
-        }
-        [micTrack] = stream.getAudioTracks();
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       } catch (err) {
         console.error("Error accessing mic:", err);
         return;
       }
 
-      // Start the WebRTC session
       try {
         el.connection.disabled = true;
         el.info.style.display = 'block';
         el.info.textContent = "Connecting...";
-        isClosing = false;
 
-        connection = new RTCPeerConnection();
+        // Analyser for VAD
+        const micSource = head.audioCtx.createMediaStreamSource(micStream);
+        analyserNode = head.audioCtx.createAnalyser();
+        analyserNode.fftSize = 2048;
+        micSource.connect(analyserNode);
 
-        connection.ontrack = async (e) => {
-          if (e.track.kind !== "audio") return;
-          const track = e.track;
-          const stream = e.streams[0];
-
-          // Workaround for an old Chrome bug in which Web Audio nodes
-          // don’t start processing remote MediaStream tracks unless
-          // a native <audio> element touches the stream.
-          audioMuted = new Audio();
-          audioMuted.muted = true;
-          audioMuted.srcObject = stream;
-          
-          const source = head.audioCtx.createMediaStreamSource(stream);
-          source.connect(head.audioAnalyzerNode);
+        // MediaRecorder
+        mediaRecorder = new MediaRecorder(micStream);
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) audioChunks.push(e.data);
+        };
+        mediaRecorder.onstop = async () => {
+          const chunks = audioChunks.splice(0);
+          if (chunks.length && sessionActive) {
+            const blob = new Blob(chunks, { type: mediaRecorder.mimeType });
+            await sendTurn(blob);
+          }
         };
 
-        connection.addTrack(micTrack, stream);
-
-        // New data channel
-        datachannel = connection.createDataChannel("oai");
-        datachannel.addEventListener("open", sendInitialMessage);
-        datachannel.addEventListener("message", handleMessage);
-        await connection.setLocalDescription();
-
-        const newSession = {
-          type: "realtime",
-          model: model,
-          instructions: instructions,
-          audio: {
-            output: {
-              voice: voice
-            }
-          },
-          tools: functions
-        };
-
-        const fd = new FormData();
-        fd.set("sdp", connection.localDescription.sdp);
-        fd.set("session", JSON.stringify(newSession));
-
-        const baseUrl = "https://api.openai.com/v1/realtime/calls";
-        const apikey = el.apikey.value;
-        const response = await fetch(`${baseUrl}?model=${model}`, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${apikey}`
-            },
-            body: fd
-        });
-        if (!response.ok) {
-            console.error("Failed to fetch SDP answer:", await response.text());
-        }
-
-        // Extract call ID from the Location header - could be useful for debugging
-        const location = response.headers.get("Location");
-        const callId = location?.split("/").pop();
-        console.log("call created:", callId);
-
-        const answerSdp = await response.text();
-        console.log("SDP answer:", answerSdp);
-
-        await connection.setRemoteDescription({type: "answer", sdp: answerSdp});
-
-        // Wait for connection to be established before proceeding
-        await new Promise((resolve, reject) => {
-          let timeout;
-          const waitConnected = () => {
-            if (connection.connectionState === "connected") {
-              console.log("Peer connection established!");
-              clearTimeout(timeout);
-              connection.removeEventListener("connectionstatechange", waitConnected);
-              resolve();
-            }
-          };
-          const waitTimeout = () => {
-            connection.removeEventListener("connectionstatechange", waitConnected);
-            reject(`Connection timeout. Current state: ${connection.connectionState}`)
-          };
-          timeout = setTimeout( waitTimeout , 10_000);
-          connection.addEventListener("connectionstatechange", waitConnected);
-        });
+        sessionActive = true;
+        conversationHistory = [];
 
         el.info.style.display = 'none';
         el.label.style.display = "none";
         el.apikey.style.display = "none";
         el.connection.disabled = false;
-        el.connection.value  = "Disconnect";
+        el.connection.value = "Disconnect";
+
+        // Send first greeting turn via a text prompt (no audio needed to start)
+        await sendTurn(null);
 
       } catch (err) {
         console.error("Error starting session:", err);
-        el.info.textContent = err.message?.slice() || "Unknown error.";
+        el.info.textContent = redactSecrets(err.message) || "Unknown error.";
         endSession(true);
       }
     }
 
     /**
-    * End the current session by sending instructions for a closing message.
-    * 
-    * @param {boolean} silent If true, doesn't notify the user in any way.
+    * Start the VAD-driven recording loop.
+    * Monitors mic levels and starts/stops MediaRecorder around speech segments.
     */
-    async function endSession(silent=false) {
+    function startListening() {
+      if (!sessionActive || isAISpeaking || !analyserNode) return;
 
-      if ( !silent ) {
-        el.info.style.display = 'block';
-        el.info.textContent = "Disconnecting...";
+      let recordingStartTime = 0;
+      const dataArray = new Float32Array(analyserNode.fftSize);
 
-        // Give AI agent a chance to say goodbye
-        if ( !isClosing && datachannel?.readyState === "open" ) {
-          isClosing = true;
-          sendClosingMessage();
-          return;
+      const loop = () => {
+        if (!sessionActive || isAISpeaking) return;
+        vadRafId = requestAnimationFrame(loop);
+
+        analyserNode.getFloatTimeDomainData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i] * dataArray[i];
+        const db = 20 * Math.log10(Math.sqrt(sum / dataArray.length) + 1e-10);
+        const hasSpeech = db > VAD_SPEECH_DB;
+
+        if (hasSpeech) {
+          if (!isRecording) {
+            isRecording = true;
+            recordingStartTime = Date.now();
+            audioChunks = [];
+            mediaRecorder.start(100);
+            head.lookAtCamera(500);
+          }
+          clearTimeout(silenceTimer);
+          silenceTimer = null;
+        } else if (isRecording && !silenceTimer) {
+          silenceTimer = setTimeout(() => {
+            silenceTimer = null;
+            if (isRecording) {
+              isRecording = false;
+              if ((Date.now() - recordingStartTime) >= VAD_MIN_MS) {
+                mediaRecorder.stop(); // triggers onstop -> sendTurn
+              } else {
+                audioChunks = [];
+                try { mediaRecorder.stop(); } catch (_) {}
+              }
+            }
+          }, VAD_SILENCE_MS);
+        }
+      };
+
+      vadRafId = requestAnimationFrame(loop);
+    }
+
+    /**
+    * Stop the VAD loop and any in-progress recording.
+    */
+    function stopListening() {
+      if (vadRafId) { cancelAnimationFrame(vadRafId); vadRafId = null; }
+      clearTimeout(silenceTimer); silenceTimer = null;
+      if (isRecording) {
+        isRecording = false;
+        try { if (mediaRecorder?.state !== "inactive") mediaRecorder.stop(); } catch (_) {}
+      }
+    }
+
+    /**
+    * Convert decoded audio buffer into WAV bytes (PCM16, mono).
+    *
+    * @param {AudioBuffer} audioBuffer Decoded audio.
+    * @return {Uint8Array} WAV byte array.
+    */
+    function audioBufferToWavBytes(audioBuffer) {
+      const sampleRate = audioBuffer.sampleRate;
+      const channels = audioBuffer.numberOfChannels;
+      const frameCount = audioBuffer.length;
+      const wavDataBytes = frameCount * 2; // mono, 16-bit
+      const buf = new ArrayBuffer(44 + wavDataBytes);
+      const view = new DataView(buf);
+
+      const writeStr = (off, str) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i));
+      };
+
+      writeStr(0, "RIFF");
+      view.setUint32(4, 36 + wavDataBytes, true);
+      writeStr(8, "WAVE");
+      writeStr(12, "fmt ");
+      view.setUint32(16, 16, true);      // PCM header size
+      view.setUint16(20, 1, true);       // PCM format
+      view.setUint16(22, 1, true);       // mono
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true); // mono * 16-bit
+      view.setUint16(32, 2, true);       // block align
+      view.setUint16(34, 16, true);      // bits per sample
+      writeStr(36, "data");
+      view.setUint32(40, wavDataBytes, true);
+
+      const output = new Int16Array(buf, 44, frameCount);
+      const channelData = [];
+      for (let c = 0; c < channels; c++) channelData.push(audioBuffer.getChannelData(c));
+
+      for (let i = 0; i < frameCount; i++) {
+        let sample = 0;
+        for (let c = 0; c < channels; c++) sample += channelData[c][i];
+        sample /= channels;
+        sample = Math.max(-1, Math.min(1, sample));
+        output[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+      }
+
+      return new Uint8Array(buf);
+    }
+
+    /**
+    * Convert a recorded browser audio Blob (e.g. webm) into base64 WAV.
+    *
+    * @param {Blob} blob Recorded audio blob.
+    * @return {Promise<string>} Base64-encoded WAV bytes.
+    */
+    async function convertBlobToWavBase64(blob) {
+      const ab = await blob.arrayBuffer();
+      const decoded = await head.audioCtx.decodeAudioData(ab.slice(0));
+      const wavBytes = audioBufferToWavBytes(decoded);
+      let bin = "";
+      for (let i = 0; i < wavBytes.length; i++) bin += String.fromCharCode(wavBytes[i]);
+      return btoa(bin);
+    }
+
+    /**
+    * Send one conversation turn to OpenRouter and handle the response.
+    * If blob is null, sends a text prompt to trigger the AI's initial greeting.
+    *
+    * @param {Blob|null} blob Recorded audio blob, or null for text-only prompt.
+    */
+    async function sendTurn(blob) {
+      stopListening();
+      el.info.style.display = 'block';
+      el.info.textContent = "Thinking...";
+
+      try {
+        let userMessage;
+        if (blob) {
+          const b64 = await convertBlobToWavBase64(blob);
+          userMessage = {
+            role: "user",
+            content: [{ type: "input_audio", input_audio: { data: b64, format: "wav" } }]
+          };
+        } else {
+          userMessage = { role: "user", content: "Please introduce yourself and ask how you can help." };
         }
 
+        conversationHistory.push(userMessage);
+
+        const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${sessionApiKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": window.location.origin,
+            "X-OpenRouter-Title": "HeadAudio"
+          },
+          body: JSON.stringify({
+            model: model,
+            stream: true,
+            modalities: ["text", "audio"],
+            audio: { voice: voice, format: "pcm16" },
+            messages: [
+              { role: "system", content: instructions },
+              ...conversationHistory
+            ]
+          })
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(
+            `OpenRouter API error ${response.status} ${response.statusText}\n` +
+            redactSecrets(errText)
+          );
+        }
+
+        // Read SSE stream, accumulating audio base64 chunks and transcript
+        let audioB64 = "";
+        let transcriptParts = [];
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          // Process all complete SSE lines in the buffer
+          const lines = buffer.split("\n");
+          buffer = lines.pop(); // keep the last (possibly incomplete) line
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const payload = line.slice(6).trim();
+            if (payload === "[DONE]") break;
+            let chunk;
+            try { chunk = JSON.parse(payload); } catch (_) { continue; }
+
+            const delta = chunk.choices?.[0]?.delta;
+            if (!delta) continue;
+
+            // Audio base64 chunk
+            if (delta.audio?.data) audioB64 += delta.audio.data;
+
+            // Transcript delta (may come via delta.audio.transcript or delta.content)
+            if (delta.audio?.transcript) transcriptParts.push(delta.audio.transcript);
+            else if (typeof delta.content === "string") transcriptParts.push(delta.content);
+          }
+        }
+
+        const rawTranscript = transcriptParts.join("");
+
+        // Execute embedded [CMD:...] tokens and strip them from the stored transcript
+        const cleanTranscript = parseAndExecuteCmds(rawTranscript);
+        conversationHistory.push({ role: "assistant", content: cleanTranscript });
+
+        el.info.style.display = 'none';
+
+        if (audioB64) {
+          await playAudioResponse(audioB64);
+        } else {
+          if (sessionActive) startListening();
+        }
+
+      } catch (err) {
+        console.error("Turn error:", err);
+        const msg = redactSecrets(err.message) || "Error";
+        el.info.style.display = 'block';
+        el.info.textContent = `Error: ${msg.slice(0, 500)}`;
+        if (sessionActive) startListening();
+      }
+    }
+
+    /**
+    * Wrap raw PCM16 bytes (16-bit signed, mono, 24 kHz) in a WAV container
+    * so AudioContext.decodeAudioData() can handle it.
+    *
+    * @param {Uint8Array} pcmBytes Raw PCM16 bytes.
+    * @return {ArrayBuffer} A complete WAV file buffer.
+    */
+    function pcm16ToWav(pcmBytes) {
+      const sampleRate = 24000;
+      const numChannels = 1;
+      const bitsPerSample = 16;
+      const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+      const blockAlign = numChannels * (bitsPerSample / 8);
+      const dataLen = pcmBytes.byteLength;
+      const buf = new ArrayBuffer(44 + dataLen);
+      const view = new DataView(buf);
+      const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+      writeStr(0, "RIFF");
+      view.setUint32(4, 36 + dataLen, true);
+      writeStr(8, "WAVE");
+      writeStr(12, "fmt ");
+      view.setUint32(16, 16, true);          // chunk size
+      view.setUint16(20, 1, true);           // PCM
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, byteRate, true);
+      view.setUint16(32, blockAlign, true);
+      view.setUint16(34, bitsPerSample, true);
+      writeStr(36, "data");
+      view.setUint32(40, dataLen, true);
+      new Uint8Array(buf, 44).set(pcmBytes);
+      return buf;
+    }
+
+    /**
+    * Decode a base64 PCM16 response from the API, wrap it in a WAV header,
+    * and play it through the Web Audio graph so HeadAudio can drive lip-sync.
+    *
+    * @param {string} b64 Base64-encoded PCM16 audio.
+    */
+    async function playAudioResponse(b64) {
+      const binary = atob(b64);
+      const pcmBytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) pcmBytes[i] = binary.charCodeAt(i);
+
+      const wavBuffer = pcm16ToWav(pcmBytes);
+
+      let audioBuffer;
+      try {
+        audioBuffer = await head.audioCtx.decodeAudioData(wavBuffer);
+      } catch (err) {
+        console.error("Failed to decode AI audio:", err);
+        if (sessionActive) startListening();
+        return;
       }
 
-      // Datachannel
-      if (datachannel) {
-        try { datachannel.removeEventListener("open", sendInitialMessage); } catch (_) {}
-        try { datachannel.removeEventListener("message", handleMessage); } catch (_) {}
-        try { datachannel.close(); } catch (_) {}
-        datachannel = null;
+      const source = head.audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      // Route through speech gain so HeadAudio processes it for lip-sync
+      source.connect(head.audioSpeechGainNode);
+
+      isAISpeaking = true;
+      head.isSpeaking = true;
+      source.start();
+
+      source.onended = () => {
+        isAISpeaking = false;
+        head.isSpeaking = false;
+        if (sessionActive) startListening();
+      };
+    }
+
+    /**
+    * End the session: stop VAD, recording, and microphone.
+    *
+    * @param {boolean} silent If true, skips UI updates.
+    */
+    async function endSession(silent=false) {
+      sessionActive = false;
+
+      stopListening();
+
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        try { mediaRecorder.stop(); } catch (_) {}
+      }
+      mediaRecorder = null;
+      audioChunks = [];
+
+      if (micStream) {
+        micStream.getTracks().forEach(t => { try { t.stop(); } catch (_) {} });
+        micStream = null;
       }
 
-      // Connection
-      if (connection) {
-        try {
-          connection.getSenders()?.forEach(sender => {
-            try { connection.removeTrack(sender); } catch (_) {}
-          });
-        } catch (_) {}
-        try { connection.close(); } catch (_) {}
-        connection.ontrack = null;
-        connection.onicecandidate = null;
-        connection.onconnectionstatechange = null;
-        connection = null;
-      }
+      analyserNode = null;
+      isRecording = false;
+      isAISpeaking = false;
+      conversationHistory = [];
+      sessionApiKey = "";
 
-      // Microphone
-      if ( micTrack ) {
-        try { micTrack.stop(); } catch (_) {}
-        micTrack = null;
-      }
-
-      // Chrome workaround
-      if ( audioMuted ) {
-        try { audioMuted.srcObject = null; } catch (_) {}
-        audioMuted = null;
-      }
-
-      if ( !silent ) {
+      if (!silent) {
         el.info.style.display = "none";
       }
 
       el.label.style.display = "inline-block";
       el.apikey.style.display = "inline-block";
       el.connection.disabled = false;
-      el.connection.value  = "Connect";
-      isClosing = false;
+      el.connection.value = "Connect";
 
       console.log("Session ended.");
     }
@@ -626,8 +737,8 @@
     <div id="info"></div>
   </div>
   <div id="controls">
-    <label id="label" for="apikey" disabled>OpenAI:</label>
-    <input id="apikey" name="apikey" type="text" placeholder="API Key" disabled/>
+    <label id="label" for="apikey" disabled>OpenRouter:</label>
+    <input id="apikey" name="apikey" type="text" placeholder="OpenRouter API Key" disabled/>
     <input id="connection" type="button" value="Connect" disabled/>
   </div>
   <div id="github">
